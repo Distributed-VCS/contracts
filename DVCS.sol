@@ -1,119 +1,126 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @title DVCS - decentralized version control system
-/// @notice on-chain source of truth for repositories, conmmits, branches and 
-/// tags. Actual file contents are not stored on chain( that would be prohibitively expensive);
-/// instread each commit stores:
-/// - "treeroot": a keccat255 merkel rot of the tracked file tree,
-/// computed client-side, while lets anyone
-/// verify a downloaded snapshot matches what are commited.
-/// - "cid": a content identifier (e.g. an iPFS cid) pointing at the offchain ojectbundle
-///for that commit
-/// everything that defines "history and permission " -who
-/// committed what, when , on top of which parent(s), who is allowed to push, and what
-//and what a branch/tag currently points at -- lives on chain
-// and is therefore tamper eveident and indpendent of any single server.
+/// @title DVCS - Decentralized Version Control System
+/// @notice On-chain source of truth for repositories, commits, branches and
+///         tags. Actual file contents are NOT stored on-chain (that would be
+///         prohibitively expensive); instead each commit stores:
+///           - `treeRoot`: a keccak256 Merkle root of the tracked file tree,
+///             computed client-side (see cli/dvcs.v), which lets anyone
+///             verify a downloaded snapshot matches what was committed.
+///           - `cid`: a content identifier (e.g. an IPFS CID) pointing at
+///             the off-chain object bundle for that commit.
+///         Everything that defines *history and permissions* -- who
+///         committed what, when, on top of which parent(s), who is allowed
+///         to push, and what a branch/tag currently points at -- lives on
+///         chain and is therefore tamper-evident and independent of any
+///         single server.
 contract DVCS {
-  //limits 
-  
-  /// @notice maximum bytes of (possibly encrypted) payload allowed in a 
-  //singel pushBlob chuck call. Kept comfortably below typical
-  //block gas and transaction size limits so no single chuck
-  //transaction is ever at risk of being dropped or failing
-  //becausse of its own size --large files are split into more 
-  //chunks instead of bigger ones. Each chuck is also its own
-  //indpendent, immediately confirmed transaction, so if a 
-  //push is interrupted ( or one chuck,s transaction fails),
-  //every chuck that already landed on chain stays there 
-  //nothing already confirmed is lost, only what hadn't been sent yet
-  //needs to be retried (the CLI's local changelog and
-  //'blob Announced" check make that resumable').
-  uint256 public constant MAX_CHUNK_BYTES = 24_576;
-  
-  /// @notice sanity bound on how many chunk a single blob may be split
-  //into, keeping client-side reconstruction bounded even for
-  //unexpectedly large files(24kb*4096 =~ 96MB ceiling/blob).
-  uint256 public constant MAX_CHUNK_PER_BLOB = 4096;
-  
-  //types 
+    // ---------------------------------------------------------------
+    // Limits
+    // ---------------------------------------------------------------
 
-  enum Role {
-    None,// no access 0 
-    Reader,// 1 - can be tracked as explicit member of a privat repo
-    Contributor,// 2 can push commits, create branch/tags
-    Maintainer // 2 can also force update/delete branches, manage,collaborators
-  }
+    /// @notice Maximum bytes of (possibly encrypted) payload allowed in a
+    ///         single pushBlobChunk call. Kept comfortably below typical
+    ///         block gas and transaction-size limits so no single chunk
+    ///         transaction is ever at risk of being dropped or failing
+    ///         because of its own size -- large files are split into more
+    ///         chunks instead of bigger ones. Each chunk is also its own
+    ///         independent, immediately-confirmed transaction, so if a
+    ///         push is interrupted (or one chunk's transaction fails),
+    ///         every chunk that already landed on-chain stays there --
+    ///         nothing already confirmed is lost, only what hadn't been
+    ///         sent yet needs to be retried (the CLI's local changelog and
+    ///         `blobAnnounced` check make that resumable, see README).
+    uint256 public constant MAX_CHUNK_BYTES = 24_576; // 24 KiB
 
-  struct Commit{
-    bytes32 parent1; // for the root commit
-    bytes32 parent2; // non-zero only for merge commits
-    bytes32 treeRoot; //Merkle root of the commited file tree
-    string cid; // off chain content identifier
-    string message; //commit message
-    address author; // msg.sender that authored teh commit
-    uint64 timestamp; // block.timestamp at commit time 
-    bool exists;
-  }
+    /// @notice Sanity bound on how many chunks a single blob may be split
+    ///         into, keeping client-side reconstruction bounded even for
+    ///         unexpectedly large files (24KB * 4096 =~ 96MB ceiling/blob).
+    uint32 public constant MAX_CHUNKS_PER_BLOB = 4096;
 
-  struct Repository {
-    address owner;
-    string name;
-    bool isPrivate;
-    bool exists;
-    uint256 commitCount;
-    uint8 minApprovals; // pr need at least this many approvals to merge
-    mapping(bytes32 => Commit) commits;
-    mapping(string => bytes32) branchHead;
-    mapping(string => bool) branchExists;
-    string[] branchNames;
-    mapping(string => bytes32) tags;
-    mapping(string => bool) tagExists;
-    mapping(address => Role) roles;
-    address[] collaborators;
-  }
+    // ---------------------------------------------------------------
+    // Types
+    // ---------------------------------------------------------------
 
-  enum PRStatus {
-    Open,
-    Merged,
-    Closed
-  }
+    enum Role {
+        None, // 0 - no access
+        Reader, // 1 - can be tracked as explicit member of a private repo
+        Contributor, // 2 - can push commits, create branches/tags
+        Maintainer // 3 - can also force-update/delete branches, manage collaborators
+    }
 
-  struct PullRequest {
-    bool exists;
-    string sourceBranch;
-    string targetBranch;
-    address author;
-    string title;
-    string description;
-    PRStatus status;
-    uint256 approvalCount;
-    bytes32 mergedCommit;
-    uint64 createdAt;
-    mapping(address => bool) hasApproved;
-  }
+    struct Commit {
+        bytes32 parent1; // zero for the root commit
+        bytes32 parent2; // non-zero only for merge commits
+        bytes32 treeRoot; // Merkle root of the committed file tree
+        string cid; // off-chain content identifier (e.g. IPFS CID)
+        string message; // commit message
+        address author; // msg.sender that authored the commit
+        uint64 timestamp; // block.timestamp at commit time
+        bool exists;
+    }
 
-  // storage 
-  //
-  mapping(bytes32 => Repository) private repositories;
-  bytes32[] public repositoryIds;
+    struct Repository {
+        address owner;
+        string name;
+        bool isPrivate;
+        bool exists;
+        uint256 commitCount;
+        uint8 minApprovals; // PRs need at least this many approvals to merge (0 == treated as 1)
+        mapping(bytes32 => Commit) commits;
+        mapping(string => bytes32) branchHead; // branch name -> commit hash
+        mapping(string => bool) branchExists;
+        string[] branchNames;
+        mapping(string => bytes32) tags; // tag name -> commit hash (immutable once set)
+        mapping(string => bool) tagExists;
+        mapping(address => Role) roles;
+        address[] collaborators;
+    }
 
-  ///@dev repoId => blobHash -> announced. a blob only needs to be 
-  //pushed once even if referenced by many commits
-  //this lets a pushing client cheaply check whether its
-  //can skip re-uploading one.
-  //
-  mapping(bytes32 => mapping( bytes32 => bool)) public blobAnnounced;
+    enum PRStatus {
+        Open,
+        Merged,
+        Closed
+    }
 
-  /// @dev repoid -> pr id -> PullRequest, and repoId => next pr identifier
-  //also usable as how many prs exist for iteration.
-  //
-  mapping(bytes32 => mapping(uint256 => PullRequest)) private pullRequests;
-  mapping(bytes32 => uint256) public pullRequestCount;
-  
-  //events 
-  //
-  event RepositoryCreated(bytes32 indexed repoId, address indexed owner, string name, bool isPrivate);
+    struct PullRequest {
+        bool exists;
+        string sourceBranch;
+        string targetBranch;
+        address author;
+        string title;
+        string description;
+        PRStatus status;
+        uint256 approvalCount;
+        bytes32 mergedCommit;
+        uint64 createdAt;
+        mapping(address => bool) hasApproved;
+    }
+
+    // ---------------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------------
+
+    mapping(bytes32 => Repository) private repositories;
+    bytes32[] public repositoryIds;
+
+    /// @dev repoId => blobHash => announced. A blob only needs to be
+    ///      pushed once even if referenced by many commits (e.g. an
+    ///      unchanged file across commits); this lets a pushing client
+    ///      cheaply check whether it can skip re-uploading one.
+    mapping(bytes32 => mapping(bytes32 => bool)) public blobAnnounced;
+
+    /// @dev repoId => prId => PullRequest, and repoId => next PR id
+    ///      (also usable as "how many PRs exist" for iteration).
+    mapping(bytes32 => mapping(uint256 => PullRequest)) private pullRequests;
+    mapping(bytes32 => uint256) public pullRequestCount;
+
+    // ---------------------------------------------------------------
+    // Events
+    // ---------------------------------------------------------------
+
+    event RepositoryCreated(bytes32 indexed repoId, address indexed owner, string name, bool isPrivate);
     event CommitPushed(bytes32 indexed repoId, bytes32 indexed commitHash, bytes32 parent1, bytes32 parent2, address indexed author, string cid);
     event BranchCreated(bytes32 indexed repoId, string branchName, bytes32 commitHash);
     event BranchUpdated(bytes32 indexed repoId, string branchName, bytes32 oldHead, bytes32 newHead, bool forced);
@@ -147,9 +154,11 @@ contract DVCS {
         bytes data
     );
 
-  //errors 
-    //
-  error RepositoryAlreadyExists();
+    // ---------------------------------------------------------------
+    // Errors
+    // ---------------------------------------------------------------
+
+    error RepositoryAlreadyExists();
     error RepositoryNotFound();
     error NotAuthorized();
     error CommitAlreadyExists();
@@ -170,10 +179,12 @@ contract DVCS {
     error CannotApproveOwnPR();
     error AlreadyApproved();
     error NotEnoughApprovals();
-  
-  //modifiers 
-    //
-  modifier repoExists(bytes32 repoId) {
+
+    // ---------------------------------------------------------------
+    // Modifiers
+    // ---------------------------------------------------------------
+
+    modifier repoExists(bytes32 repoId) {
         if (!repositories[repoId].exists) revert RepositoryNotFound();
         _;
     }
@@ -197,26 +208,28 @@ contract DVCS {
         _;
     }
 
-  //identity registry
+    // ---------------------------------------------------------------
+    // Identity registry (self-sovereign handles)
+    // ---------------------------------------------------------------
     //
-  //repo owners often don't know a collaborator's raw 0x address 
-    //this lets an account claim a human readable handle (an email 
-    //address is a natural choice, but any string works) so others can 
-    //refere to they by that instead. Claiming a handle is a transaction
-    //from the account begin claimed for, so a handle to address pointing
-    //is cryptographically signed by that address own key nobody 
-    //else can claim a handle "as" your address 
+    // Repo owners often don't know a collaborator's raw 0x address --
+    // this lets an account claim a human-readable handle (an email
+    // address is a natural choice, but any string works) so others can
+    // refer to them by that instead. Claiming a handle is a transaction
+    // FROM the account being claimed for, so a handle-to-address binding
+    // is cryptographically signed by that address's own key -- nobody
+    // else can claim a handle "as" your address.
     //
-    // this proves address ownership not inbox ownership 
-    // nothing here verifies that the string you register is an email 
-    // address you actually control that would require an off chain
-    // verifier briding email to chain, 
-    // whis is a different kind of system that a smart contract can be on its own.
-    // treat a handle as a claimed nickname bound to a key,
-    // the same trust level as a git commit's author field useful for
-    // humans, not a substitute for verifying identity out of band before 
+    // IMPORTANT: this proves *address ownership*, not *inbox ownership*.
+    // Nothing here verifies that the string you register is an email
+    // address you actually control -- that would require an off-chain
+    // verifier (send a code, prove receipt) bridging email to chain,
+    // which is a different kind of system than a smart contract can be
+    // on its own. Treat a handle as a claimed nickname bound to a key,
+    // the same trust level as a Git commit's author field -- useful for
+    // humans, not a substitute for verifying identity out of band before
     // you grant someone a role.
-    //
+
     mapping(string => address) public handleOwner; // handle => address (address(0) if unclaimed)
     mapping(address => string) public addressHandle; // address => their current handle ("" if none)
 
@@ -263,8 +276,10 @@ contract DVCS {
         return a;
     }
 
-    // repo managment
-    //
+    // ---------------------------------------------------------------
+    // Repository management
+    // ---------------------------------------------------------------
+
     /// @notice Deterministically derive a repository id from its creator and name,
     ///         so a given (owner, name) pair can only ever be created once.
     function computeRepoId(address owner, string calldata name) public pure returns (bytes32) {
@@ -299,49 +314,52 @@ contract DVCS {
         emit VisibilityChanged(repoId, isPrivate);
     }
 
-  // Access control
-    //
-    function setCollaboratorRole(byte32 repoId, address account, Role role)
-      external
-      repoExists(repoId)
-      onlyMaintainer(repoId)
-      {
-        if(account == address(0)) revert ZeroAddress();
-        Repository storage r = reppositories[repoId];
-        if(r.roles[account] == Role.None && role != Role.None) {
-          r.collaborators.push(account);
+    // ---------------------------------------------------------------
+    // Access control
+    // ---------------------------------------------------------------
+
+    function setCollaboratorRole(bytes32 repoId, address account, Role role)
+        external
+        repoExists(repoId)
+        onlyMaintainer(repoId)
+    {
+        if (account == address(0)) revert ZeroAddress();
+        Repository storage r = repositories[repoId];
+        if (r.roles[account] == Role.None && role != Role.None) {
+            r.collaborators.push(account);
         }
         r.roles[account] = role;
-        emit CollaboratorUpdated(repoId,account,role);
+        emit CollaboratorUpdated(repoId, account, role);
     }
 
-    function roleOf(bytes32 repoId, address account) external view repoExists(repoId) {
-      Repository storage r = repositories[repoId];
-      if(account == r.owner) return Role.Maintainer;
-      return r.roles[account];
+    function roleOf(bytes32 repoId, address account) external view repoExists(repoId) returns (Role) {
+        Repository storage r = repositories[repoId];
+        if (account == r.owner) return Role.Maintainer;
+        return r.roles[account];
     }
 
-    function collaborators(bytes32 repoId) external view repoExists(repoId) returns(address[] memory) {
-      return repositories[repoId].collaborators;
+    function collaborators(bytes32 repoId) external view repoExists(repoId) returns (address[] memory) {
+        return repositories[repoId].collaborators;
     }
 
-   //blob content
-    //
-    //@notice Publish one chuck of a blob's content as an event log.
-    //'blobhash' shoulbe keccak256 of the plaintext content
-    //regardless of encrypted, so it stays a stable identifier
-    //tied to what a commit's tree actually references clients 
-    //verify that hash themselves after decrypting.
-    //
+    // ---------------------------------------------------------------
+    // Blob content (chunked, via events -- see BlobChunk above)
+    // ---------------------------------------------------------------
+
+    /// @notice Publish one chunk of a blob's content as an event log.
+    ///         `blobHash` should be keccak256 of the *plaintext* content
+    ///         regardless of `encrypted`, so it stays a stable identifier
+    ///         tied to what a commit's tree actually references -- clients
+    ///         verify that hash themselves after decrypting.
     function pushBlobChunk(
-      bytes32 repoId,
-      bytes32 blobhash,
-      uint32 chunkIndex,
-      uint32 totalChunks,
-      bool encrypted,
-      bytes calldata data
+        bytes32 repoId,
+        bytes32 blobHash,
+        uint32 chunkIndex,
+        uint32 totalChunks,
+        bool encrypted,
+        bytes calldata data
     ) external repoExists(repoId) onlyContributor(repoId) {
-      if (totalChunks == 0 || chunkIndex >= totalChunks) revert InvalidChunk();
+        if (totalChunks == 0 || chunkIndex >= totalChunks) revert InvalidChunk();
         if (totalChunks > MAX_CHUNKS_PER_BLOB) revert TooManyChunks();
         if (data.length > MAX_CHUNK_BYTES) revert ChunkTooLarge();
         if (chunkIndex == 0) {
@@ -350,9 +368,11 @@ contract DVCS {
         emit BlobChunk(repoId, blobHash, chunkIndex, totalChunks, encrypted, data);
     }
 
-  // commits
-    //
-  /// @notice Deterministic commit hash, mirroring how the CLI computes it
+    // ---------------------------------------------------------------
+    // Commits
+    // ---------------------------------------------------------------
+
+    /// @notice Deterministic commit hash, mirroring how the CLI computes it
     ///         client-side before submitting the transaction.
     function computeCommitHash(
         bytes32 repoId,
@@ -480,8 +500,10 @@ contract DVCS {
         }
     }
 
-    // branches 
-    //
+    // ---------------------------------------------------------------
+    // Branches
+    // ---------------------------------------------------------------
+
     function updateBranch(bytes32 repoId, string calldata branchName, bytes32 newHead, bool force)
         external
         repoExists(repoId)
@@ -555,8 +577,10 @@ contract DVCS {
         return repositories[repoId].branchNames;
     }
 
-  // Tags (immutable pointers, not like branches)
-    //
+    // ---------------------------------------------------------------
+    // Tags (immutable pointers, unlike branches)
+    // ---------------------------------------------------------------
+
     function createTag(bytes32 repoId, string calldata tagName, bytes32 commitHash)
         external
         repoExists(repoId)
@@ -578,12 +602,14 @@ contract DVCS {
         return r.tags[tagName];
     }
 
-    // pull request prpose merging one branch into another require
-    // review ( approval from someone other than the author, with 
-    // Maintainer authority or higher) before the merge can happen. 
-    // this is a wrokflow dconvention layerd on top of branches/ commits git
-    // itselt has no concept of a PR, this contract adds one.
-    //
+    // ---------------------------------------------------------------
+    // Pull requests: propose merging one branch into another, require
+    // review (approval from someone other than the author, with
+    // Maintainer authority or higher) before the merge can happen. This is
+    // a workflow convention layered on top of branches/commits -- git
+    // itself has no concept of a PR, this contract adds one.
+    // ---------------------------------------------------------------
+
     function setMinApprovals(bytes32 repoId, uint8 n) external repoExists(repoId) onlyMaintainer(repoId) {
         repositories[repoId].minApprovals = n;
     }
@@ -713,20 +739,22 @@ contract DVCS {
     {
         return pullRequests[repoId][prId].hasApproved[account];
     }
-    
-  // Read Helper
-    //
-    function repositoryInfo(bytes32 repoId)
-      external
-      view
-      repoExists(repoId)
-      returns(address owner, string memory name, bool isPrivate, uint256 commitCount, uint256 branchCount) 
-      {
-        Repository storage r = repositories[repoId];
-        return(r.owner,r.name,r.isPrivate,r.commitCount,r.branchNames.length);
-      }
 
-    function repositoryCount() external view returns(uint256) {
-      return repositoryIds.length;
+    // ---------------------------------------------------------------
+    // Read helpers
+    // ---------------------------------------------------------------
+
+    function repositoryInfo(bytes32 repoId)
+        external
+        view
+        repoExists(repoId)
+        returns (address owner, string memory name, bool isPrivate, uint256 commitCount, uint256 branchCount)
+    {
+        Repository storage r = repositories[repoId];
+        return (r.owner, r.name, r.isPrivate, r.commitCount, r.branchNames.length);
+    }
+
+    function repositoryCount() external view returns (uint256) {
+        return repositoryIds.length;
     }
 }
